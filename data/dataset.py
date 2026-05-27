@@ -62,6 +62,8 @@ class FineWebDataset(torch.utils.data.IterableDataset):
         dataset_name: str = "HuggingFaceFW/fineweb-edu",
     ):
         super().__init__()
+        if split == "validation":
+            split = "train"
         self.dataset = load_dataset(
             dataset_name, split=split, streaming=True
         )
