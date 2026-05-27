@@ -11,6 +11,12 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import CLIPModel, CLIPImageProcessor
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from config import ModelConfig
 from model.model import MoETransformer
 from model.projector import Projector
@@ -75,6 +81,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--warmup", type=int, default=50)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--eval-interval", type=int, default=50)
     p.add_argument("--save-interval", type=int, default=200)
 
@@ -82,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-wandb", action="store_false", dest="wandb")
     p.add_argument("--wandb-project", type=str, default="hypersparsity-lm")
     p.add_argument("--wandb-run", type=str, default=None)
+    p.add_argument("--wandb-key", type=str, default=None, help="W&B API key (avoids interactive login)")
 
     return p.parse_args()
 
@@ -155,8 +163,9 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     data_iter = iter(loader)
 
     # === W&B ===
-    if main and args.wandb:
-        import wandb
+    if main and args.wandb and WANDB_AVAILABLE:
+        if args.wandb_key:
+            wandb.login(key=args.wandb_key)
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run or f"align-layer{args.layer}",
@@ -166,6 +175,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     # === Training ===
     projector.train()
     optimizer.zero_grad()
+    scaler = torch.cuda.amp.GradScaler()
     accum_loss = 0.0
     start_time = time.time()
 
@@ -186,24 +196,28 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
                 image_embeds = clip.get_image_features(pixel_values=images)
                 image_embeds = F.normalize(image_embeds, dim=-1)
 
-                lm_out = lm(input_ids, return_layer=args.layer)
-                h = lm_out["hidden_states"]
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    lm_out = lm(input_ids, return_layer=args.layer)
+                    h = lm_out["hidden_states"]
 
             if h is None:
                 raise RuntimeError(
                     f"return_layer={args.layer} out of range (LM has {len(lm.blocks)} layers)"
                 )
 
-            text_embeds = projector(h)
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                text_embeds = projector(h)
 
             loss = contrastive_loss(image_embeds, text_embeds, logit_scale)
             loss = loss / args.grad_accum
 
-            loss.backward()
+            scaler.scale(loss).backward()
             micro_loss += loss.item()
 
-        torch.nn.utils.clip_grad_norm_(projector.parameters(), 1.0)
-        optimizer.step()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(projector.parameters(), args.max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
         warmup_scheduler.step()
         optimizer.zero_grad()
 
@@ -224,8 +238,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
                     f"{elapsed:.1f}s"
                 )
                 print(msg)
-                if args.wandb:
-                    import wandb
+                if args.wandb and WANDB_AVAILABLE:
                     wandb.log({"loss": avg_loss, "lr": current_lr, "logit_scale": scale_val, "step": step})
 
             accum_loss = 0.0
@@ -243,8 +256,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         path = f"checkpoints/projector_final.pt"
         torch.save({"projector": projector.state_dict(), "logit_scale": logit_scale, "args": args}, path)
         print(f"Saved {path}")
-        if args.wandb:
-            import wandb
+        if args.wandb and WANDB_AVAILABLE:
             wandb.finish()
 
     print(f"Alignment complete (rank {rank})")

@@ -59,6 +59,8 @@ class MoETransformer(nn.Module):
         input_ids: torch.Tensor,
         image_prefix: Optional[torch.Tensor] = None,
         return_layer: Optional[int] = None,
+        past_key_values: Optional[list] = None,
+        use_cache: bool = False,
     ) -> Dict[str, torch.Tensor]:
         h = self.token_embed(input_ids)
         h = self.embed_proj(h)
@@ -72,12 +74,16 @@ class MoETransformer(nn.Module):
         expert_utils = []
         router_logits_list = []
         hidden_states = None
+        new_past_key_values = [] if use_cache else None
 
         for i, block in enumerate(self.blocks):
-            h, aux_loss, expert_util, router_logits = block(h)
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            h, aux_loss, expert_util, router_logits, new_kv = block(h, past_kv=past_kv, use_cache=use_cache)
             total_aux_loss = total_aux_loss + aux_loss
             expert_utils.append(expert_util)
             router_logits_list.append(router_logits)
+            if use_cache:
+                new_past_key_values.append(new_kv)
             if return_layer is not None and i == return_layer:
                 if n_prefix > 0:
                     hidden_states = h[:, n_prefix:]
@@ -95,6 +101,8 @@ class MoETransformer(nn.Module):
             "expert_utils": torch.stack(expert_utils),
             "router_logits": router_logits_list,
         }
+        if use_cache:
+            result["past_key_values"] = new_past_key_values
         if hidden_states is not None:
             result["hidden_states"] = hidden_states
         return result

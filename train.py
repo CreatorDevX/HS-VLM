@@ -18,8 +18,21 @@ except ImportError:
     from torch.optim import AdamW
     ADAMW_8BIT = False
 
+try:
+    from Sophia import SophiaG
+    SOPHIA_AVAILABLE = True
+except ImportError:
+    SOPHIA_AVAILABLE = False
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from config import ModelConfig, TrainingConfig, compute_ntk_base
 from model.model import MoETransformer
+from model.loss import multi_token_cross_entropy
 from data.dataset import create_dataloader, load_or_train_tokenizer
 
 
@@ -48,30 +61,6 @@ def cleanup_ddp():
 
 def is_main_process(rank: int) -> bool:
     return rank == 0
-
-
-def compute_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    weights: tuple = (1.0, 1.0, 1.0, 1.0),
-) -> torch.Tensor:
-    if logits.dim() == 3:
-        B, T, vocab = logits.shape
-        return F.cross_entropy(
-            logits[:, :-1].reshape(-1, vocab),
-            targets[:, 1:].reshape(-1),
-        )
-
-    B, T, n_pred, vocab = logits.shape
-    loss = 0.0
-    for k in range(n_pred):
-        shift_logits = logits[:, : T - k - 1, k]
-        shift_targets = targets[:, k + 1 :]
-        loss = loss + weights[k] * F.cross_entropy(
-            shift_logits.reshape(-1, vocab),
-            shift_targets.reshape(-1),
-        )
-    return loss
 
 
 def get_cosine_schedule_with_warmup(
@@ -133,7 +122,7 @@ def evaluate(
         with torch.amp.autocast("cuda", dtype=amp_dtype):
             outputs = model(input_ids)
             logits = outputs["logits"]
-            ce_loss = compute_loss(
+            ce_loss = multi_token_cross_entropy(
                 logits, input_ids, weights=pred_token_weights
             )
         total_loss = total_loss + ce_loss.item()
@@ -153,18 +142,19 @@ def generate(
     top_k: int = 50,
     amp_dtype: torch.dtype = torch.float16,
 ):
-    model.eval()
     input_ids = torch.tensor(tokenizer.encode(prompt).ids, dtype=torch.long)
     input_ids = input_ids.unsqueeze(0).cuda()
 
+    with torch.amp.autocast("cuda", dtype=amp_dtype):
+        outputs = model(input_ids, use_cache=True)
+    past_key_values = outputs["past_key_values"]
+    logits = outputs["logits"]
+    if logits.dim() == 4:
+        logits = logits[0, -1, 0]
+    else:
+        logits = logits[0, -1]
+
     for _ in range(max_new_tokens):
-        with torch.amp.autocast("cuda", dtype=amp_dtype):
-            outputs = model(input_ids)
-        logits = outputs["logits"]
-        if logits.dim() == 4:
-            logits = logits[0, -1, 0]
-        else:
-            logits = logits[0, -1]
         logits = logits / temperature
 
         if top_k > 0:
@@ -175,7 +165,15 @@ def generate(
         next_token = torch.multinomial(probs, num_samples=1).unsqueeze(0)
         input_ids = torch.cat([input_ids, next_token], dim=1)
 
-    model.train()
+        with torch.amp.autocast("cuda", dtype=amp_dtype):
+            outputs = model(next_token, past_key_values=past_key_values, use_cache=True)
+        past_key_values = outputs["past_key_values"]
+        logits = outputs["logits"]
+        if logits.dim() == 4:
+            logits = logits[0, -1, 0]
+        else:
+            logits = logits[0, -1]
+
     return tokenizer.decode(input_ids[0].tolist())
 
 
@@ -183,7 +181,6 @@ def generate_text_table(
     model: nn.Module, tokenizer, prompts, amp_dtype, max_new_tokens=64,
 ) -> list:
     results = []
-    model.eval()
     for prompt in prompts:
         output = generate(
             model, prompt, tokenizer,
@@ -191,7 +188,6 @@ def generate_text_table(
             temperature=0.8, top_k=50, amp_dtype=amp_dtype,
         )
         results.append({"prompt": prompt, "output": output})
-    model.train()
     return results
 
 
@@ -243,7 +239,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-pred-tokens", type=int, default=4)
     p.add_argument("--no-mtp", action="store_true", help="Disable multi-token prediction (n_pred_tokens=1)")
     p.add_argument("--capacity-factor", type=float, default=1.25)
-    p.add_argument("--z-loss-coeff", type=float, default=1e-4)
+    p.add_argument("--z-loss-coeff", type=float, default=1e-3)
     p.add_argument("--load-balance-coeff", type=float, default=1e-2)
     p.add_argument("--norm-eps", type=float, default=1e-6)
     p.add_argument("--max-seq-len", type=int, default=2048)
@@ -255,14 +251,17 @@ def parse_args() -> argparse.Namespace:
 
     # === Training ===
     p.add_argument("--total-tokens", type=float, default=1e9, help="Total training tokens")
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--min-lr", type=float, default=3e-5)
+    p.add_argument("--optimizer", type=str, default="sophia", choices=["adamw", "sophia"])
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--min-lr", type=float, default=2e-5)
     p.add_argument("--warmup", type=int, default=None, help="Warmup steps (default: 5%% of total)")
     p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument("--beta1", type=float, default=0.9)
-    p.add_argument("--beta2", type=float, default=0.95)
+    p.add_argument("--beta1", type=float, default=0.965)
+    p.add_argument("--beta2", type=float, default=0.99)
     p.add_argument("--eps", type=float, default=1e-8)
+    p.add_argument("--rho", type=float, default=0.03, help="Sophia clipping threshold")
     p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32"])
 
     # === Batch ===
     p.add_argument("--micro-batch-size", type=int, default=8)
@@ -281,6 +280,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-wandb", action="store_false", dest="wandb")
     p.add_argument("--wandb-project", type=str, default="hypersparsity-lm")
     p.add_argument("--wandb-run", type=str, default=None)
+    p.add_argument("--wandb-key", type=str, default=None, help="W&B API key (avoids interactive login)")
 
     return p.parse_args()
 
@@ -351,7 +351,12 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
 
     total_steps = train_cfg.max_steps
     tokens_per_step = train_cfg.tokens_per_step
-    amp_dtype = torch.float16
+    if args.dtype == "bf16":
+        amp_dtype = torch.bfloat16
+    elif args.dtype == "fp32":
+        amp_dtype = torch.float32
+    else:
+        amp_dtype = torch.float16
     main = is_main_process(rank)
 
     # === Print summary ===
@@ -367,16 +372,20 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         print(f"Tokens:    {train_cfg.total_tokens/1e9:.1f}B  |  Steps: {total_steps} ({tokens_per_step:,}/step)")
         print(f"Data:      {train_cfg.dataset_name}")
         print(f"LR:        {train_cfg.learning_rate} -> {train_cfg.min_lr}  warmup={train_cfg.warmup_steps}")
-        print(f"Optimizer: {'AdamW 8-bit' if ADAMW_8BIT else 'AdamW (32-bit)'}")
-        print(f"Compile:   {'torch.compile' if args.compile else 'disabled'}  |  FP16 + GradScaler")
+        if args.optimizer == "sophia":
+            print(f"Optimizer: SophiaG (rho={args.rho})")
+        else:
+            print(f"Optimizer: {'AdamW 8-bit' if ADAMW_8BIT else 'AdamW (32-bit)'}")
+        print(f"Compile:   {'torch.compile' if args.compile else 'disabled'}  |  {args.dtype.upper()} + GradScaler")
         print(f"GPUs:      {world_size} {'DDP' if ddp_enabled else 'single'}")
         print(f"Micro-batch: {train_cfg.micro_batch_size}  |  Grad accum: {train_cfg.grad_accum_steps}")
         print(f"Compute:   ~{flops/1e15:.1f} PFLOPs  |  ~{flops/1e15/0.15:.0f}s @ 150 TFLOPs")
         print(f"{'='*60}")
 
     # === Wandb ===
-    if main and train_cfg.use_wandb:
-        import wandb
+    if main and train_cfg.use_wandb and WANDB_AVAILABLE:
+        if args.wandb_key:
+            wandb.login(key=args.wandb_key)
         wandb.init(
             project=train_cfg.wandb_project,
             name=train_cfg.wandb_run_name,
@@ -388,8 +397,13 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
 
     if args.phase2:
         ckpt_path = args.checkpoint or "checkpoints/step_1907.pt"
-        raw_model.load_state_dict(torch.load(ckpt_path, map_location="cuda")["model"], strict=False)
+        state_dict = torch.load(ckpt_path, map_location="cuda")["model"]
+        missing, unexpected = raw_model.load_state_dict(state_dict, strict=False)
         if main:
+            if missing:
+                print(f"  Missing keys (expected for Phase 2): {missing}")
+            if unexpected:
+                print(f"  Unexpected keys: {unexpected}")
             print(f"Loaded checkpoint: {ckpt_path}")
             print(f"RoPE base extended to {model_cfg.rope_base:.0f}")
 
@@ -404,12 +418,24 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     model = DDP(raw_model, device_ids=[rank]) if ddp_enabled else raw_model
 
     # === Optimiser & LR schedule ===
-    param_groups = get_weight_decay_param_groups(model, train_cfg.weight_decay, train_cfg.learning_rate)
-    optimizer = AdamW(param_groups, betas=(train_cfg.beta1, train_cfg.beta2), eps=train_cfg.eps)
+    use_sophia = args.optimizer == "sophia"
+    if use_sophia:
+        if not SOPHIA_AVAILABLE:
+            raise ImportError("SophiaG not installed. Run: pip install Sophia-Optimizer")
+        optimizer = SophiaG(
+            model.parameters(),
+            lr=train_cfg.learning_rate,
+            betas=(train_cfg.beta1, train_cfg.beta2),
+            rho=args.rho,
+            weight_decay=train_cfg.weight_decay,
+        )
+    else:
+        param_groups = get_weight_decay_param_groups(model, train_cfg.weight_decay, train_cfg.learning_rate)
+        optimizer = AdamW(param_groups, betas=(train_cfg.beta1, train_cfg.beta2), eps=train_cfg.eps)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, warmup_steps=train_cfg.warmup_steps, total_steps=total_steps, min_lr=train_cfg.min_lr,
     )
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", init_scale=2.**8, growth_factor=1.5)
 
     # === Data ===
     train_loader = create_dataloader(
@@ -444,6 +470,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         micro_loss = 0.0
         micro_ce = 0.0
         micro_aux = 0.0
+        micro_expert_util = 0.0
 
         for micro_step in range(train_cfg.grad_accum_steps):
             try:
@@ -459,7 +486,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             with ctx, torch.amp.autocast("cuda", dtype=amp_dtype):
                 outputs = model(input_ids)
                 logits = outputs["logits"]
-                ce_loss = compute_loss(logits, input_ids, weights=train_cfg.pred_token_weights)
+                ce_loss = multi_token_cross_entropy(logits, input_ids, weights=train_cfg.pred_token_weights)
                 aux_loss = outputs["aux_loss"]
                 loss = (ce_loss + aux_loss) / train_cfg.grad_accum_steps
 
@@ -467,6 +494,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             micro_loss += loss.item()
             micro_ce += (ce_loss / train_cfg.grad_accum_steps).item()
             micro_aux += (aux_loss / train_cfg.grad_accum_steps).item()
+            micro_expert_util += outputs["expert_utils"].float().mean().item()
 
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
@@ -482,9 +510,9 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         # --- Logging ---
         if step % train_cfg.log_interval == 0:
             elapsed = time.time() - start_time
-            tok_per_sec = tokens_per_step * train_cfg.log_interval / elapsed
+            tok_per_sec = train_cfg.tokens_per_step * train_cfg.log_interval / elapsed
             current_lr = scheduler.get_last_lr()[0]
-            avg_util = outputs["expert_utils"].float().mean().item()
+            avg_util = micro_expert_util / train_cfg.grad_accum_steps
 
             log_data = {
                 "loss": accum_loss / train_cfg.log_interval,
@@ -497,8 +525,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             }
 
             if main:
-                if train_cfg.use_wandb:
-                    import wandb
+                if train_cfg.use_wandb and WANDB_AVAILABLE:
                     wandb.log(log_data, step=step)
                 print(
                     f"Step {step:>6d}/{total_steps} | "
@@ -518,8 +545,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         # --- Evaluation ---
         if step % train_cfg.eval_interval == 0 and main and val_loader is not None:
             metrics = evaluate(model, val_loader, train_cfg.pred_token_weights, amp_dtype, num_batches=10)
-            if train_cfg.use_wandb:
-                import wandb
+            if train_cfg.use_wandb and WANDB_AVAILABLE:
                 wandb.log(metrics, step=step)
             print(f"  Eval step {step}: val_loss={metrics['val_loss']:.4f} val_ppl={metrics['val_ppl']:.2f}")
             model.train()
@@ -541,8 +567,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
                 print(f"    prompt: {g['prompt']}")
                 print(f"    output: {g['output'][:120]}...")
                 print()
-            if train_cfg.use_wandb:
-                import wandb
+            if train_cfg.use_wandb and WANDB_AVAILABLE:
                 wandb.log({
                     "generations": wandb.Table(
                         columns=["step", "prompt", "output"],
@@ -578,8 +603,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             print(f"Output: {g['output']}")
             print("-" * 60)
 
-        if train_cfg.use_wandb:
-            import wandb
+        if train_cfg.use_wandb and WANDB_AVAILABLE:
             wandb.log({
                 "generations": wandb.Table(
                     columns=["step", "prompt", "output"],

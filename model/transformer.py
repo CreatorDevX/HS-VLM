@@ -13,11 +13,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = torch.sqrt(
-            torch.mean(x.float() ** 2, dim=-1, keepdim=True) + self.eps
-        )
-        x_normed = x.float() / rms
-        return (x_normed * self.weight).to(x.dtype)
+        input_dtype = x.dtype
+        x_f32 = x.to(torch.float32)
+        rms = torch.sqrt(torch.mean(x_f32 ** 2, dim=-1, keepdim=True) + self.eps)
+        return ((x_f32 / rms) * self.weight.to(torch.float32)).to(input_dtype)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -45,14 +44,14 @@ class RoPE(nn.Module):
 
     @torch.no_grad()
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor
+        self, q: torch.Tensor, k: torch.Tensor, start_pos: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor]:
         T = q.size(2)
-        cos = self.cos[:T].view(1, 1, T, self.d_head)
-        sin = self.sin[:T].view(1, 1, T, self.d_head)
-        q_embed = (q.float() * cos) + (rotate_half(q).float() * sin)
-        k_embed = (k.float() * cos) + (rotate_half(k).float() * sin)
-        return q_embed.to(q.dtype), k_embed.to(k.dtype)
+        cos = self.cos[start_pos:start_pos+T].view(1, 1, T, self.d_head)
+        sin = self.sin[start_pos:start_pos+T].view(1, 1, T, self.d_head)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -88,19 +87,36 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(n_heads * d_head, d_model, bias=False)
         self.rope = RoPE(d_head, max_seq_len, rope_base)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple = None,
+        use_cache: bool = False,
+    ) -> tuple:
         B, T, _ = x.shape
         q = self.q_proj(x).reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
         k = self.k_proj(x).reshape(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).reshape(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
 
-        q, k = self.rope(q, k)
+        start_pos = 0
+        if past_kv is not None:
+            start_pos = past_kv[0].size(2)
+
+        q, k = self.rope(q, k, start_pos=start_pos)
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        new_kv = (k, v) if use_cache else None
+
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=(past_kv is None))
         attn_out = attn_out.transpose(1, 2).reshape(B, T, -1)
-        return self.out_proj(attn_out)
+        return self.out_proj(attn_out), new_kv
 
 
 class TransformerBlock(nn.Module):
@@ -139,8 +155,14 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNorm(d_model, eps=norm_eps)
         self.norm2 = RMSNorm(d_model, eps=norm_eps)
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.norm1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple = None,
+        use_cache: bool = False,
+    ):
+        attn_out, new_kv = self.attention(self.norm1(x), past_kv=past_kv, use_cache=use_cache)
+        x = x + attn_out
         moe_out, aux_loss, expert_util, router_logits = self.moe(self.norm2(x))
         x = x + moe_out
-        return x, aux_loss, expert_util, router_logits
+        return x, aux_loss, expert_util, router_logits, new_kv

@@ -24,7 +24,7 @@ class ModelConfig:
     max_seq_len: int = 2048
     rope_base: float = 10000.0
     tie_embeddings: bool = True
-    z_loss_coeff: float = 1e-4
+    z_loss_coeff: float = 1e-3
     load_balance_coeff: float = 1e-2
 
     @property
@@ -87,16 +87,16 @@ class TrainingConfig:
     total_tokens: int = 1_000_000_000
 
     # Optimization
-    learning_rate: float = 3e-4
-    min_lr: float = 3e-5
+    learning_rate: float = 2e-4
+    min_lr: float = 2e-5
     weight_decay: float = 0.1
-    beta1: float = 0.9
-    beta2: float = 0.95
+    beta1: float = 0.965
+    beta2: float = 0.99
     eps: float = 1e-8
     max_grad_norm: float = 1.0
 
     # MoE aux losses
-    z_loss_coeff: float = 1e-4
+    z_loss_coeff: float = 1e-3
     load_balance_coeff: float = 1e-2
 
     # Multi-token prediction

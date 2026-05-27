@@ -57,7 +57,7 @@ class MoELayer(nn.Module):
         tokens = x.view(-1, D)
         num_tokens = tokens.shape[0]
 
-        router_logits = self.router(tokens)
+        router_logits = self.router(tokens.float())
         router_probs, top_k_probs, top_k_indices = self._top_k_routing(router_logits)
 
         load_balance_loss, z_loss = self._compute_aux_losses(

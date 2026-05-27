@@ -20,11 +20,10 @@ class FineWebDataset(torch.utils.data.IterableDataset):
         dataset_name: str = "HuggingFaceFW/fineweb-edu",
     ):
         super().__init__()
+        ds = load_dataset(dataset_name, split="train", streaming=True)
         if split == "validation":
-            split = "train"
-        self.dataset = load_dataset(
-            dataset_name, split=split, streaming=True
-        )
+            ds = ds.skip(10000)
+        self.dataset = ds
         self.tokenizer = tokenizer
         self.seq_len = seq_len
 
@@ -58,7 +57,7 @@ def create_dataloader(
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        num_workers=2,
-        prefetch_factor=4,
+        num_workers=4,
+        prefetch_factor=8,
     )
     return dataloader

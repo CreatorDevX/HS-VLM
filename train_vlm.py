@@ -11,8 +11,15 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import CLIPModel, CLIPImageProcessor
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from config import ModelConfig
 from model.model import MoETransformer
+from model.loss import multi_token_cross_entropy
 from model.visual_prefix import VisualPrefixEncoder
 from model.projector import Projector
 from data.dataset import load_or_train_tokenizer
@@ -37,23 +44,6 @@ def cleanup_ddp():
 
 def is_main_process(rank: int) -> bool:
     return rank == 0
-
-
-def multi_token_cross_entropy(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    weights: tuple = (1.0, 1.0, 1.0, 1.0),
-) -> torch.Tensor:
-    B, T, n_pred, vocab = logits.shape
-    loss = 0.0
-    for k in range(n_pred):
-        shift_logits = logits[:, : T - k - 1, k]
-        shift_targets = targets[:, k + 1 :]
-        loss = loss + weights[k] * F.cross_entropy(
-            shift_logits.reshape(-1, vocab),
-            shift_targets.reshape(-1),
-        )
-    return loss
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-wandb", action="store_false", dest="wandb")
     p.add_argument("--wandb-project", type=str, default="hypersparsity-lm")
     p.add_argument("--wandb-run", type=str, default=None)
+    p.add_argument("--wandb-key", type=str, default=None, help="W&B API key (avoids interactive login)")
 
     return p.parse_args()
 
@@ -106,7 +97,6 @@ def generate_caption(
     top_k: int = 50,
     device: torch.device = torch.device("cuda"),
 ):
-    lm.eval()
     prefix_encoder.eval()
 
     image_tensor = clip_processor(image, return_tensors="pt").pixel_values.to(device)
@@ -115,11 +105,13 @@ def generate_caption(
 
     input_ids = torch.tensor([[tokenizer.token_to_id("<bos>")]], dtype=torch.long, device=device)
 
+    with torch.amp.autocast("cuda", dtype=torch.float16):
+        outputs = lm(input_ids, image_prefix=prefix, use_cache=True)
+    past_key_values = outputs["past_key_values"]
+    logits = outputs["logits"]
+    logits = logits[0, -1, 0] if logits.dim() == 4 else logits[0, -1]
+
     for _ in range(max_new_tokens):
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            outputs = lm(input_ids, image_prefix=prefix)
-        logits = outputs["logits"]
-        logits = logits[0, -1, 0] if logits.dim() == 4 else logits[0, -1]
         logits = logits / temperature
 
         if top_k > 0:
@@ -130,7 +122,12 @@ def generate_caption(
         next_token = torch.multinomial(probs, num_samples=1).unsqueeze(0)
         input_ids = torch.cat([input_ids, next_token], dim=1)
 
-    lm.train()
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            outputs = lm(next_token, past_key_values=past_key_values, use_cache=True)
+        past_key_values = outputs["past_key_values"]
+        logits = outputs["logits"]
+        logits = logits[0, -1, 0] if logits.dim() == 4 else logits[0, -1]
+
     prefix_encoder.train()
     return tokenizer.decode(input_ids[0].tolist())
 
@@ -219,8 +216,9 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     data_iter = iter(loader)
 
     # === W&B ===
-    if main and args.wandb:
-        import wandb
+    if main and args.wandb and WANDB_AVAILABLE:
+        if args.wandb_key:
+            wandb.login(key=args.wandb_key)
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run or f"vlm-{args.n_queries}q",
@@ -284,8 +282,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
                     f"{elapsed:.1f}s"
                 )
                 print(msg)
-                if args.wandb:
-                    import wandb
+                if args.wandb and WANDB_AVAILABLE:
                     wandb.log({"loss": avg_loss, "lr": current_lr}, step=step)
 
             accum_loss = 0.0
@@ -303,8 +300,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             print(f"\n  --- Generation at step {step} ---")
             print(f"    reference: {sample_caption}")
             print(f"    generated: {generated}")
-            if args.wandb:
-                import wandb
+            if args.wandb and WANDB_AVAILABLE:
                 wandb.log({
                     "generation_ref": sample_caption,
                     "generation_out": generated,
@@ -329,8 +325,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             "args": args,
         }, path)
         print(f"Saved {path}")
-        if args.wandb:
-            import wandb
+        if args.wandb and WANDB_AVAILABLE:
             wandb.finish()
 
     print(f"Visual prefix training complete (rank {rank})")
