@@ -118,7 +118,8 @@ def generate_caption(
     for _ in range(max_new_tokens):
         with torch.amp.autocast("cuda", dtype=torch.float16):
             outputs = lm(input_ids, image_prefix=prefix)
-        logits = outputs["logits"][0, -1, 0]
+        logits = outputs["logits"]
+        logits = logits[0, -1, 0] if logits.dim() == 4 else logits[0, -1]
         logits = logits / temperature
 
         if top_k > 0:

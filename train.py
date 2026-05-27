@@ -160,7 +160,11 @@ def generate(
     for _ in range(max_new_tokens):
         with torch.amp.autocast("cuda", dtype=amp_dtype):
             outputs = model(input_ids)
-        logits = outputs["logits"][0, -1, 0]
+        logits = outputs["logits"]
+        if logits.dim() == 4:
+            logits = logits[0, -1, 0]
+        else:
+            logits = logits[0, -1]
         logits = logits / temperature
 
         if top_k > 0:
