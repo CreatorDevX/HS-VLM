@@ -1,12 +1,14 @@
 import torch
 from datasets import load_dataset
-from tokenizers import Tokenizer
+from tokenizers import Tokenizer, decoders
 
 
 def load_or_train_tokenizer(
     tokenizer_path: str,
 ) -> Tokenizer:
-    return Tokenizer.from_file(tokenizer_path)
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    tokenizer.decoder = decoders.ByteLevel()
+    return tokenizer
 
 
 class FineWebDataset(torch.utils.data.IterableDataset):

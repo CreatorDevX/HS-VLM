@@ -50,11 +50,18 @@ def is_main_process(rank: int) -> bool:
     return rank == 0
 
 
-def multi_token_cross_entropy(
+def compute_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     weights: tuple = (1.0, 1.0, 1.0, 1.0),
 ) -> torch.Tensor:
+    if logits.dim() == 3:
+        B, T, vocab = logits.shape
+        return F.cross_entropy(
+            logits[:, :-1].reshape(-1, vocab),
+            targets[:, 1:].reshape(-1),
+        )
+
     B, T, n_pred, vocab = logits.shape
     loss = 0.0
     for k in range(n_pred):
@@ -126,7 +133,7 @@ def evaluate(
         with torch.amp.autocast("cuda", dtype=amp_dtype):
             outputs = model(input_ids)
             logits = outputs["logits"]
-            ce_loss = multi_token_cross_entropy(
+            ce_loss = compute_loss(
                 logits, input_ids, weights=pred_token_weights
             )
         total_loss = total_loss + ce_loss.item()
@@ -230,6 +237,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-experts", type=int, default=32)
     p.add_argument("--top-k", type=int, default=2)
     p.add_argument("--n-pred-tokens", type=int, default=4)
+    p.add_argument("--no-mtp", action="store_true", help="Disable multi-token prediction (n_pred_tokens=1)")
     p.add_argument("--capacity-factor", type=float, default=1.25)
     p.add_argument("--z-loss-coeff", type=float, default=1e-4)
     p.add_argument("--load-balance-coeff", type=float, default=1e-2)
@@ -287,7 +295,7 @@ def build_configs(args: argparse.Namespace):
         d_ff_expert=args.d_ff_expert,
         n_experts=args.n_experts,
         top_k=args.top_k,
-        n_pred_tokens=args.n_pred_tokens,
+        n_pred_tokens=1 if args.no_mtp else args.n_pred_tokens,
         capacity_factor=args.capacity_factor,
         z_loss_coeff=args.z_loss_coeff,
         load_balance_coeff=args.load_balance_coeff,
@@ -447,7 +455,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             with ctx, torch.amp.autocast("cuda", dtype=amp_dtype):
                 outputs = model(input_ids)
                 logits = outputs["logits"]
-                ce_loss = multi_token_cross_entropy(logits, input_ids, weights=train_cfg.pred_token_weights)
+                ce_loss = compute_loss(logits, input_ids, weights=train_cfg.pred_token_weights)
                 aux_loss = outputs["aux_loss"]
                 loss = (ce_loss + aux_loss) / train_cfg.grad_accum_steps
 
