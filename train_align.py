@@ -140,8 +140,6 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     # === Tokenizer & Data ===
     tokenizer = load_or_train_tokenizer(
         tokenizer_path=args.tokenizer_path,
-        vocab_size=args.vocab_size,
-        dataset_name=args.dataset,
     )
 
     loader = create_clip_dataloader(

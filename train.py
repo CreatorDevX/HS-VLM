@@ -239,7 +239,6 @@ def parse_args() -> argparse.Namespace:
 
     # === Data ===
     p.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu")
-    p.add_argument("--dataset-samples", type=int, default=10000)
     p.add_argument("--tokenizer-path", type=str, default="tokenizer.json")
 
     # === Training ===
@@ -306,7 +305,6 @@ def build_configs(args: argparse.Namespace):
 
     train_cfg = TrainingConfig(
         dataset_name=args.dataset,
-        dataset_sample_size=args.dataset_samples,
         tokenizer_path=args.tokenizer_path,
         seq_len=model_cfg.max_seq_len,
         total_tokens=int(args.total_tokens),
@@ -394,25 +392,24 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, warmup_steps=train_cfg.warmup_steps, total_steps=total_steps, min_lr=train_cfg.min_lr,
     )
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler("cuda")
 
     # === Data ===
     train_loader = create_dataloader(
         tokenizer_path=train_cfg.tokenizer_path, seq_len=train_cfg.seq_len,
         batch_size=train_cfg.micro_batch_size, split="train",
-        dataset_name=train_cfg.dataset_name, vocab_size=model_cfg.vocab_size,
+        dataset_name=train_cfg.dataset_name,
     )
     val_loader = None
     if main:
         val_loader = create_dataloader(
             tokenizer_path=train_cfg.tokenizer_path, seq_len=train_cfg.seq_len,
             batch_size=train_cfg.micro_batch_size, split="validation",
-            dataset_name=train_cfg.dataset_name, vocab_size=model_cfg.vocab_size,
+            dataset_name=train_cfg.dataset_name,
         )
 
     tokenizer = load_or_train_tokenizer(
-        tokenizer_path=train_cfg.tokenizer_path, dataset_name=train_cfg.dataset_name,
-        vocab_size=model_cfg.vocab_size,
+        tokenizer_path=train_cfg.tokenizer_path,
     )
 
     # === Training loop ===
@@ -426,6 +423,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     best_val_loss = float("inf")
 
     for step in range(1, total_steps + 1):
+        torch.compiler.cudagraph_mark_step_begin()
         micro_loss = 0.0
         micro_ce = 0.0
         micro_aux = 0.0

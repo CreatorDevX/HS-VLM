@@ -82,7 +82,6 @@ class ModelConfig:
 class TrainingConfig:
     # Data
     dataset_name: str = "HuggingFaceFW/fineweb-edu"
-    dataset_sample_size: int = 10000
     tokenizer_path: str = "tokenizer.json"
     seq_len: int = 2048
     total_tokens: int = 1_000_000_000
