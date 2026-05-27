@@ -4,17 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SwiGLUExpert(nn.Module):
-    def __init__(self, d_model: int, d_ff: int):
-        super().__init__()
-        self.w1 = nn.Linear(d_model, d_ff, bias=False)
-        self.w2 = nn.Linear(d_model, d_ff, bias=False)
-        self.w3 = nn.Linear(d_ff, d_model, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
-
-
 class MoELayer(nn.Module):
     def __init__(
         self,
@@ -34,14 +23,11 @@ class MoELayer(nn.Module):
         self.load_balance_coeff = load_balance_coeff
 
         self.router = nn.Linear(d_model, n_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [SwiGLUExpert(d_model, d_ff) for _ in range(n_experts)]
-        )
 
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
+        # Stacked expert weights: one big batched matmul instead of 32 small ones
+        self.w1 = nn.Parameter(torch.randn(n_experts, d_ff, d_model) * 0.02)
+        self.w2 = nn.Parameter(torch.randn(n_experts, d_ff, d_model) * 0.02)
+        self.w3 = nn.Parameter(torch.randn(n_experts, d_model, d_ff) * 0.02)
 
     def _top_k_routing(self, router_logits: torch.Tensor):
         router_probs = F.softmax(router_logits.float(), dim=-1)
@@ -87,39 +73,52 @@ class MoELayer(nn.Module):
         final_output = torch.zeros_like(tokens)
         expert_util = torch.zeros(self.n_experts, device=x.device, dtype=torch.long)
 
-        # Flatten all routing assignments: (num_tokens * top_k,) each
-        flat_experts = top_k_indices.flatten()
+        # Flatten routing assignments
+        flat_experts = top_k_indices.flatten()  # (num_tokens * top_k,)
         flat_tokens = torch.arange(num_tokens, device=x.device).repeat_interleave(self.top_k)
         flat_route = torch.arange(self.top_k, device=x.device).repeat(num_tokens)
 
-        # Sort by expert index so tokens for the same expert are contiguous
+        # Sort by expert for contiguous groups
         order = torch.argsort(flat_experts)
-        flat_experts = flat_experts[order]
+        flat_experits = flat_experts[order]
         flat_tokens = flat_tokens[order]
         flat_route = flat_route[order]
 
-        # Find group boundaries for each expert that has tokens
-        unique_experts, counts = torch.unique_consecutive(flat_experts, return_counts=True)
+        unique_experts, counts = torch.unique_consecutive(flat_experits, return_counts=True)
         ends = counts.cumsum(dim=0)
         starts = ends - counts
 
+        # Build padded per-expert input buffers
+        expert_buf = torch.zeros(self.n_experts, capacity, D, device=x.device, dtype=x.dtype)
+        weight_buf = torch.zeros(self.n_experts, capacity, 1, device=x.device, dtype=x.dtype)
+        token_map = torch.full((self.n_experts, capacity), -1, device=x.device, dtype=torch.long)
+
         for expert_idx, start, count in zip(unique_experts.tolist(), starts.tolist(), counts.tolist()):
             end = start + count
-            token_ids = flat_tokens[start:end]
-            route_ids = flat_route[start:end]
+            tok_ids = flat_tokens[start:end]
+            rt_ids = flat_route[start:end]
 
             if count > capacity:
-                probs = top_k_probs[token_ids, route_ids]
+                probs = top_k_probs[tok_ids, rt_ids]
                 keep = probs.argsort(descending=True)[:capacity]
-                token_ids = token_ids[keep]
-                route_ids = route_ids[keep]
+                tok_ids = tok_ids[keep]
+                rt_ids = rt_ids[keep]
                 count = capacity
 
-            expert_input = tokens[token_ids]
-            expert_output = self.experts[expert_idx](expert_input)
-            weights = top_k_probs[token_ids, route_ids].unsqueeze(-1)
-            final_output[token_ids] += expert_output * weights
+            expert_buf[expert_idx, :count] = tokens[tok_ids]
+            weight_buf[expert_idx, :count, 0] = top_k_probs[tok_ids, rt_ids]
+            token_map[expert_idx, :count] = tok_ids
             expert_util[expert_idx] = count
+
+        # Batched SwiGLU: all experts computed in one go
+        h1 = torch.bmm(expert_buf, self.w1.transpose(-1, -2))  # (n, cap, d_ff)
+        h2 = torch.bmm(expert_buf, self.w2.transpose(-1, -2))
+        expert_out = torch.bmm(F.silu(h1) * h2, self.w3.transpose(-1, -2))  # (n, cap, d_model)
+        expert_out = expert_out * weight_buf  # (n, cap, d_model)
+
+        # Scatter back
+        mask = token_map != -1
+        final_output[token_map[mask]] += expert_out[mask]
 
         aux_loss = (
             self.load_balance_coeff * load_balance_loss
