@@ -26,7 +26,7 @@ class MoETransformer(nn.Module):
                 d_ff_expert=config.d_ff_expert,
                 n_experts=config.n_experts,
                 top_k=config.top_k,
-                max_seq_len=config.max_seq_len,
+                max_seq_len=config.max_seq_len + config.n_pred_tokens,
                 rope_base=config.rope_base,
                 capacity_factor=config.capacity_factor,
                 z_loss_coeff=config.z_loss_coeff,

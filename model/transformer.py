@@ -48,8 +48,6 @@ class RoPE(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         T = q.size(2)
-        if T > self.cos.size(0):
-            self._set_cos_sin_cache(T)
         cos = self.cos[:T].view(1, 1, T, self.d_head)
         sin = self.sin[:T].view(1, 1, T, self.d_head)
         q_embed = (q.float() * cos) + (rotate_half(q).float() * sin)
