@@ -105,7 +105,7 @@ class MoELayer(nn.Module):
         token_map = torch.full((self.n_experts, capacity), -1, device=x.device, dtype=torch.long)
 
         expert_buf[flat_experts, ranks] = tokens[flat_tokens]
-        weight_buf[flat_experts, ranks, 0] = probs_flat
+        weight_buf[flat_experts, ranks, 0] = probs_flat.to(weight_buf.dtype)
         token_map[flat_experts, ranks] = flat_tokens
 
         # Compute expert util counts

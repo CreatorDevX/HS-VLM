@@ -394,7 +394,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             print(f"RoPE base extended to {model_cfg.rope_base:.0f}")
 
     if args.compile:
-        raw_model = torch.compile(raw_model, mode="reduce-overhead")
+        raw_model = torch.compile(raw_model, mode="default")
 
     if main:
         print(f"Params: {sum(p.numel() for p in raw_model.parameters()):,}")
