@@ -263,6 +263,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inference-interval", type=int, default=100)
     p.add_argument("--save-dir", type=str, default="checkpoints")
     p.add_argument("--keep-last", type=int, default=5)
+    p.add_argument("--compile", action="store_true", default=True)
+    p.add_argument("--no-compile", action="store_false", dest="compile")
     p.add_argument("--wandb", action="store_true", default=True)
     p.add_argument("--no-wandb", action="store_false", dest="wandb")
     p.add_argument("--wandb-project", type=str, default="hypersparsity-lm")
@@ -354,7 +356,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         print(f"Data:      {train_cfg.dataset_name}")
         print(f"LR:        {train_cfg.learning_rate} -> {train_cfg.min_lr}  warmup={train_cfg.warmup_steps}")
         print(f"Optimizer: {'AdamW 8-bit' if ADAMW_8BIT else 'AdamW (32-bit)'}")
-        print(f"Compile:   torch.compile  |  FP16 + GradScaler")
+        print(f"Compile:   {'torch.compile' if args.compile else 'disabled'}  |  FP16 + GradScaler")
         print(f"GPUs:      {world_size} {'DDP' if ddp_enabled else 'single'}")
         print(f"Micro-batch: {train_cfg.micro_batch_size}  |  Grad accum: {train_cfg.grad_accum_steps}")
         print(f"Compute:   ~{flops/1e15:.1f} PFLOPs  |  ~{flops/1e15/0.15:.0f}s @ 150 TFLOPs")
@@ -379,10 +381,13 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             print(f"Loaded checkpoint: {ckpt_path}")
             print(f"RoPE base extended to {model_cfg.rope_base:.0f}")
 
-    raw_model = torch.compile(raw_model, mode="reduce-overhead")
+    if args.compile:
+        raw_model = torch.compile(raw_model, mode="reduce-overhead")
 
     if main:
         print(f"Params: {sum(p.numel() for p in raw_model.parameters()):,}")
+        if not args.compile:
+            print("torch.compile disabled")
 
     model = DDP(raw_model, device_ids=[rank]) if ddp_enabled else raw_model
 

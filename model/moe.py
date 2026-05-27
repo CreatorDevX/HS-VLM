@@ -87,22 +87,39 @@ class MoELayer(nn.Module):
         final_output = torch.zeros_like(tokens)
         expert_util = torch.zeros(self.n_experts, device=x.device, dtype=torch.long)
 
-        for expert_idx in range(self.n_experts):
-            mask = top_k_indices == expert_idx
-            token_indices, route_idx = torch.where(mask)
+        # Flatten all routing assignments: (num_tokens * top_k,) each
+        flat_experts = top_k_indices.flatten()
+        flat_tokens = torch.arange(num_tokens, device=x.device).repeat_interleave(self.top_k)
+        flat_route = torch.arange(self.top_k, device=x.device).repeat(num_tokens)
 
-            if len(token_indices) > capacity:
-                probs_for_expert = top_k_probs[token_indices, route_idx]
-                _, sorted_idx = torch.sort(probs_for_expert, descending=True)
-                token_indices = token_indices[sorted_idx[:capacity]]
-                route_idx = route_idx[sorted_idx[:capacity]]
+        # Sort by expert index so tokens for the same expert are contiguous
+        order = torch.argsort(flat_experts)
+        flat_experts = flat_experts[order]
+        flat_tokens = flat_tokens[order]
+        flat_route = flat_route[order]
 
-            if len(token_indices) > 0:
-                expert_input = tokens[token_indices]
-                expert_output = self.experts[expert_idx](expert_input)
-                weights = top_k_probs[token_indices, route_idx].unsqueeze(-1)
-                final_output[token_indices] += expert_output * weights
-                expert_util[expert_idx] = len(token_indices)
+        # Find group boundaries for each expert that has tokens
+        unique_experts, counts = torch.unique_consecutive(flat_experts, return_counts=True)
+        ends = counts.cumsum(dim=0)
+        starts = ends - counts
+
+        for expert_idx, start, count in zip(unique_experts.tolist(), starts.tolist(), counts.tolist()):
+            end = start + count
+            token_ids = flat_tokens[start:end]
+            route_ids = flat_route[start:end]
+
+            if count > capacity:
+                probs = top_k_probs[token_ids, route_ids]
+                keep = probs.argsort(descending=True)[:capacity]
+                token_ids = token_ids[keep]
+                route_ids = route_ids[keep]
+                count = capacity
+
+            expert_input = tokens[token_ids]
+            expert_output = self.experts[expert_idx](expert_input)
+            weights = top_k_probs[token_ids, route_ids].unsqueeze(-1)
+            final_output[token_ids] += expert_output * weights
+            expert_util[expert_idx] = count
 
         aux_loss = (
             self.load_balance_coeff * load_balance_loss
