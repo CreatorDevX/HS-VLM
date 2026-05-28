@@ -12,17 +12,19 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
-    from bitsandbytes.optim import AdamW8bit as AdamW
-    ADAMW_8BIT = True
-except ImportError:
-    from torch.optim import AdamW
-    ADAMW_8BIT = False
-
-try:
-    from Sophia import SophiaG
+    from sophia import SophiaG
     SOPHIA_AVAILABLE = True
 except ImportError:
     SOPHIA_AVAILABLE = False
+
+try:
+    from bitsandbytes.optim import AdamW8bit
+    ADAMW_8BIT = True
+    AdamW_fallback = AdamW8bit
+except ImportError:
+    from torch.optim import AdamW
+    ADAMW_8BIT = False
+    AdamW_fallback = AdamW
 
 try:
     import wandb
@@ -372,10 +374,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         print(f"Tokens:    {train_cfg.total_tokens/1e9:.1f}B  |  Steps: {total_steps} ({tokens_per_step:,}/step)")
         print(f"Data:      {train_cfg.dataset_name}")
         print(f"LR:        {train_cfg.learning_rate} -> {train_cfg.min_lr}  warmup={train_cfg.warmup_steps}")
-        if args.optimizer == "sophia":
-            print(f"Optimizer: SophiaG (rho={args.rho})")
-        else:
-            print(f"Optimizer: {'AdamW 8-bit' if ADAMW_8BIT else 'AdamW (32-bit)'}")
+        print(f"Optimizer: {args.optimizer}")
         print(f"Compile:   {'torch.compile' if args.compile else 'disabled'}  |  {args.dtype.upper()} + GradScaler")
         print(f"GPUs:      {world_size} {'DDP' if ddp_enabled else 'single'}")
         print(f"Micro-batch: {train_cfg.micro_batch_size}  |  Grad accum: {train_cfg.grad_accum_steps}")
@@ -418,10 +417,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     model = DDP(raw_model, device_ids=[rank]) if ddp_enabled else raw_model
 
     # === Optimiser & LR schedule ===
-    use_sophia = args.optimizer == "sophia"
-    if use_sophia:
-        if not SOPHIA_AVAILABLE:
-            raise ImportError("SophiaG not installed. Run: pip install Sophia-Optimizer")
+    if args.optimizer == "sophia" and SOPHIA_AVAILABLE:
         optimizer = SophiaG(
             model.parameters(),
             lr=train_cfg.learning_rate,
@@ -429,9 +425,14 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
             rho=args.rho,
             weight_decay=train_cfg.weight_decay,
         )
+        if is_main_process(rank):
+            print(f"Optimizer: SophiaG (rho={args.rho})")
     else:
         param_groups = get_weight_decay_param_groups(model, train_cfg.weight_decay, train_cfg.learning_rate)
-        optimizer = AdamW(param_groups, betas=(train_cfg.beta1, train_cfg.beta2), eps=train_cfg.eps)
+        opt_name = "AdamW 8-bit" if ADAMW_8BIT else "AdamW (32-bit)"
+        if args.optimizer == "sophia" and not SOPHIA_AVAILABLE and is_main_process(rank):
+            print(f"SophiaG not available, falling back to {opt_name}")
+        optimizer = AdamW_fallback(param_groups, betas=(train_cfg.beta1, train_cfg.beta2), eps=train_cfg.eps)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, warmup_steps=train_cfg.warmup_steps, total_steps=total_steps, min_lr=train_cfg.min_lr,
     )
