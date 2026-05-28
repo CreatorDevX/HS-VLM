@@ -49,8 +49,8 @@ class RoPE(nn.Module):
         T = q.size(2)
         cos = self.cos[start_pos:start_pos+T].view(1, 1, T, self.d_head)
         sin = self.sin[start_pos:start_pos+T].view(1, 1, T, self.d_head)
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
+        q_embed = ((q * cos) + (rotate_half(q) * sin)).to(q.dtype)
+        k_embed = ((k * cos) + (rotate_half(k) * sin)).to(k.dtype)
         return q_embed, k_embed
 
 
