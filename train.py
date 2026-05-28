@@ -263,7 +263,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eps", type=float, default=1e-8)
     p.add_argument("--rho", type=float, default=0.03, help="Sophia clipping threshold")
     p.add_argument("--max-grad-norm", type=float, default=1.0)
-    p.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32"])
+    p.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
 
     # === Batch ===
     p.add_argument("--micro-batch-size", type=int, default=8)
