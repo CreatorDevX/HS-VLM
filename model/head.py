@@ -6,6 +6,7 @@ class MultiTokenLMHead(nn.Module):
     def __init__(self, d_model: int, d_embed: int, n_pred_tokens: int = 4):
         super().__init__()
         self.n_pred_tokens = n_pred_tokens
+        self.d_embed = d_embed
 
         if n_pred_tokens == 1:
             self.proj = nn.Linear(d_model, d_embed, bias=False)

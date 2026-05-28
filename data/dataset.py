@@ -57,7 +57,7 @@ def create_dataloader(
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        num_workers=4,
-        prefetch_factor=8,
+        num_workers=2,
+        prefetch_factor=4,
     )
     return dataloader

@@ -88,7 +88,6 @@ class TrainingConfig:
 
     # Optimization
     learning_rate: float = 2e-4
-    min_lr: float = 2e-5
     weight_decay: float = 0.1
     beta1: float = 0.965
     beta2: float = 0.99

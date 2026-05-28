@@ -65,24 +65,13 @@ def is_main_process(rank: int) -> bool:
     return rank == 0
 
 
-def get_cosine_schedule_with_warmup(
+def get_linear_decay_schedule(
     optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
     total_steps: int,
-    min_lr: float,
 ):
-    base_lr = optimizer.param_groups[0]["lr"]
-    min_lr_ratio = min_lr / base_lr
-
+    """η_t = base_lr * (1 - t/T) — linear decay from Corollary 2."""
     def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        progress = float(step - warmup_steps) / float(
-            max(1, total_steps - warmup_steps)
-        )
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1 - min_lr_ratio) * cosine
-
+        return max(0.0, 1.0 - step / max(1, total_steps))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
@@ -220,6 +209,21 @@ def save_checkpoint(
         os.remove(os.path.join(save_dir, old_ckpts.pop(0)))
 
 
+def find_latest_checkpoint(save_dir: str) -> Optional[str]:
+    if not os.path.isdir(save_dir):
+        return None
+    ckpts = [f for f in os.listdir(save_dir) if f.startswith("step_") and f.endswith(".pt")]
+    if not ckpts:
+        return None
+    def step_num(f: str) -> int:
+        try:
+            return int(f[len("step_"):-len(".pt")])
+        except ValueError:
+            return -1
+    ckpts.sort(key=step_num)
+    return os.path.join(save_dir, ckpts[-1])
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HypersparsityLM — MoE pretraining")
 
@@ -255,8 +259,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--total-tokens", type=float, default=1e9, help="Total training tokens")
     p.add_argument("--optimizer", type=str, default="sophia", choices=["adamw", "sophia"])
     p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--min-lr", type=float, default=2e-5)
-    p.add_argument("--warmup", type=int, default=None, help="Warmup steps (default: 5%% of total)")
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--beta1", type=float, default=0.965)
     p.add_argument("--beta2", type=float, default=0.99)
@@ -264,6 +266,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rho", type=float, default=0.03, help="Sophia clipping threshold")
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
+    p.add_argument("--resume", action="store_true", help="Auto-resume from latest checkpoint in save_dir")
 
     # === Batch ===
     p.add_argument("--micro-batch-size", type=int, default=8)
@@ -317,15 +320,12 @@ def build_configs(args: argparse.Namespace):
         model_cfg.rope_base = compute_ntk_base(10000.0, ext, model_cfg.d_head)
         run_name += f"-16k"
 
-    warmup_steps = args.warmup if args.warmup is not None else max(1, total_steps // 20)
-
     train_cfg = TrainingConfig(
         dataset_name=args.dataset,
         tokenizer_path=args.tokenizer_path,
         seq_len=model_cfg.max_seq_len,
         total_tokens=int(args.total_tokens),
         learning_rate=args.lr,
-        min_lr=args.min_lr,
         weight_decay=args.weight_decay,
         beta1=args.beta1,
         beta2=args.beta2,
@@ -343,7 +343,6 @@ def build_configs(args: argparse.Namespace):
         wandb_project=args.wandb_project,
         wandb_run_name=run_name,
     )
-    train_cfg.warmup_steps = warmup_steps
 
     return model_cfg, train_cfg
 
@@ -373,7 +372,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         print(f"Context:   {model_cfg.max_seq_len}  (RoPE base={model_cfg.rope_base:.0f})")
         print(f"Tokens:    {train_cfg.total_tokens/1e9:.1f}B  |  Steps: {total_steps} ({tokens_per_step:,}/step)")
         print(f"Data:      {train_cfg.dataset_name}")
-        print(f"LR:        {train_cfg.learning_rate} -> {train_cfg.min_lr}  warmup={train_cfg.warmup_steps}")
+        print(f"LR:        {train_cfg.learning_rate}  linear decay to 0")
         print(f"Optimizer: {args.optimizer}")
         print(f"Compile:   {'torch.compile' if args.compile else 'disabled'}  |  {args.dtype.upper()} + GradScaler")
         print(f"GPUs:      {world_size} {'DDP' if ddp_enabled else 'single'}")
@@ -433,9 +432,7 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         if args.optimizer == "sophia" and not SOPHIA_AVAILABLE and is_main_process(rank):
             print(f"SophiaG not available, falling back to {opt_name}")
         optimizer = AdamW_fallback(param_groups, betas=(train_cfg.beta1, train_cfg.beta2), eps=train_cfg.eps)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, warmup_steps=train_cfg.warmup_steps, total_steps=total_steps, min_lr=train_cfg.min_lr,
-    )
+    scheduler = get_linear_decay_schedule(optimizer, total_steps=total_steps)
     scaler = torch.amp.GradScaler("cuda", init_scale=2.**8, growth_factor=1.5)
 
     # === Data ===
@@ -456,6 +453,23 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
         tokenizer_path=train_cfg.tokenizer_path,
     )
 
+    # === Auto-resume ===
+    resume_step = 0
+    if args.resume:
+        ckpt_path = find_latest_checkpoint(train_cfg.save_dir)
+        if ckpt_path is not None:
+            print(f"  Resuming from checkpoint: {ckpt_path}")
+            state = torch.load(ckpt_path, map_location="cuda")
+            raw_model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            if "scaler" in state:
+                scaler.load_state_dict(state["scaler"])
+            resume_step = state["step"]
+            print(f"  Resumed at step {resume_step}")
+            if main and train_cfg.use_wandb and WANDB_AVAILABLE:
+                wandb.run._step = resume_step
+
     # === Training loop ===
     model.train()
     optimizer.zero_grad()
@@ -467,6 +481,8 @@ def train(args: argparse.Namespace, rank: int = 0, world_size: int = 1, ddp_enab
     best_val_loss = float("inf")
 
     for step in range(1, total_steps + 1):
+        if step <= resume_step:
+            continue
         torch.compiler.cudagraph_mark_step_begin()
         micro_loss = 0.0
         micro_ce = 0.0
